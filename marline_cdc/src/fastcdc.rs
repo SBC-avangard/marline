@@ -905,6 +905,7 @@ impl<R: Read> Iterator for StreamCDC<R> {
 mod tests {
     use super::*;
     use std::fs::{self, File};
+    use std::io::Cursor;
 
     #[test]
     #[should_panic]
@@ -982,6 +983,59 @@ mod tests {
                     rf, rf2,
                     "two-pass features differ at offset {} (min={min_size})",
                     chunk.offset
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_stream_features_match_slice_and_two_pass() {
+        let mut seed = 0x12345678u32;
+        let mut data = vec![0u8; 1 << 20];
+        for b in data.iter_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (seed >> 16) as u8;
+        }
+
+        for &(min_size, avg_size, max_size) in
+            &[(512usize, 1024, 2048), (4096, 8192, 16384), (131072, 262144, 524288)]
+        {
+            let slice_chunks: Vec<_> = FastCDC::new(&data, min_size, avg_size, max_size).collect();
+            let stream_chunks: Vec<_> =
+                StreamCDC::new(Cursor::new(&data), min_size, avg_size, max_size)
+                    .collect::<Result<_, _>>()
+                    .expect("reading from an in-memory cursor must not fail");
+
+            assert_eq!(
+                slice_chunks.len(),
+                stream_chunks.len(),
+                "chunk count differs between slice and stream (min={min_size})"
+            );
+            // Guards against the stream chunker returning placeholder features.
+            assert!(
+                stream_chunks.iter().any(|(_, f)| *f != [0u32; 12]),
+                "stream features must not all be zero (min={min_size})"
+            );
+
+            for ((slice_chunk, slice_feat), (stream_chunk, stream_feat)) in
+                slice_chunks.iter().zip(&stream_chunks)
+            {
+                let offset = slice_chunk.offset;
+                assert_eq!(
+                    offset as u64, stream_chunk.offset,
+                    "offset mismatch at offset {offset} (min={min_size})"
+                );
+                assert_eq!(
+                    slice_chunk.length, stream_chunk.length,
+                    "length mismatch at offset {offset} (min={min_size})"
+                );
+                assert!(
+                    slice_feat == stream_feat,
+                    "stream features differ from slice at offset {offset} (min={min_size})"
+                );
+                assert!(
+                    *stream_feat == collect_raw_features(&stream_chunk.data, min_size),
+                    "stream features differ from two-pass at offset {offset} (min={min_size})"
                 );
             }
         }
