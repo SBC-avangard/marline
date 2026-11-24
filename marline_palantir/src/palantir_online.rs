@@ -8,8 +8,8 @@ use crate::sf_generator::SuperFeatureGenerator;
 use crate::types::{BlockID, TierConfig};
 use chunkfs::{ChunkHash, Database};
 use marline_cdc::{collect_raw_features, FastCDC};
-use marline_utils::{MB, KB};
 use marline_index::heuristic_index::SearchConfig;
+use marline_utils::{KB, MB};
 use std::collections::HashMap;
 use std::hash::Hash;
 
