@@ -230,11 +230,20 @@ impl SplitMix64 {
     }
 
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        // Constants from Sebastiano Vigna's SplitMix64 reference implementation.
+        // https://prng.di.unimi.it/splitmix64.c
+        const STATE_INCREMENT: u64 = 0x9e37_79b9_7f4a_7c15;
+        const FIRST_MIX_SHIFT: u32 = 30;
+        const FIRST_MIX_MULTIPLIER: u64 = 0xbf58_476d_1ce4_e5b9;
+        const SECOND_MIX_SHIFT: u32 = 27;
+        const SECOND_MIX_MULTIPLIER: u64 = 0x94d0_49bb_1331_11eb;
+        const FINAL_MIX_SHIFT: u32 = 31;
+
+        self.0 = self.0.wrapping_add(STATE_INCREMENT);
         let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
+        z = (z ^ (z >> FIRST_MIX_SHIFT)).wrapping_mul(FIRST_MIX_MULTIPLIER);
+        z = (z ^ (z >> SECOND_MIX_SHIFT)).wrapping_mul(SECOND_MIX_MULTIPLIER);
+        z ^ (z >> FINAL_MIX_SHIFT)
     }
 }
 

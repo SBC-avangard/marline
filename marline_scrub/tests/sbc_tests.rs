@@ -4,7 +4,7 @@ mod test {
     extern crate marline_scrub;
     extern crate marline_sketcher;
 
-    use chunkfs::chunkers::SuperChunker;
+    use chunkfs::chunkers::{FSChunker, SuperChunker};
     use chunkfs::hashers::Sha256Hasher;
     use chunkfs::FileSystem;
     #[cfg(feature = "runtime-metrics")]
@@ -62,6 +62,7 @@ mod test {
         let read = fs.read_file_complete(&handle).unwrap();
         assert_eq!(read, data);
     }
+
     #[cfg(feature = "runtime-metrics")]
     #[test]
     fn scrubber_records_enabled_stage_metrics() {
@@ -98,6 +99,8 @@ mod test {
 
     #[test]
     fn test_data_recovery_speedsketch_custom_masks() {
+        const CHUNK_SIZE: usize = 4096;
+
         let config = SpeedSketchConfig::uniform(7, 99).unwrap();
         let mut fs = FileSystem::new_with_scrubber(
             HashMap::default(),
@@ -105,16 +108,21 @@ mod test {
             Box::new(SBCScrubber::new_speedsketch(config, clusterer::EqClusterer::new(0), false)),
             Sha256Hasher::default(),
         );
-        let mut handle = fs.create_file("file".to_string(), SuperChunker::default()).unwrap();
-        let data = generate_data(2);
+        let base: Vec<u8> = (0..=u8::MAX).cycle().take(CHUNK_SIZE).collect();
+        let mut similar = base.clone();
+        similar[CHUNK_SIZE - 1] ^= 1;
+        let data = [base, similar].concat();
+
+        let mut handle = fs.create_file("file", FSChunker::new(CHUNK_SIZE)).unwrap();
         fs.write_to_file(&mut handle, &data).unwrap();
         fs.close_file(handle).unwrap();
 
-        let _res = fs.scrub().unwrap();
+        let report = fs.scrub().unwrap();
+        assert!(report.processed_data > 0, "scrub must write at least one delta");
 
-        let handle = fs.open_file("file", SuperChunker::default()).unwrap();
+        let handle = fs.open_file_readonly("file").unwrap();
         let read = fs.read_file_complete(&handle).unwrap();
-        assert_eq!(read, data);
+        assert!(read == data, "recovered data differs from the original");
     }
 
     const MB: usize = 1024 * 1024;
