@@ -1004,7 +1004,7 @@ mod tests {
             let stream_chunks: Vec<_> =
                 StreamCDC::new(Cursor::new(&data), min_size, avg_size, max_size)
                     .collect::<Result<_, _>>()
-                    .expect("reading from an in-memory cursor must not fail");
+                    .unwrap();
 
             assert_eq!(
                 slice_chunks.len(),
