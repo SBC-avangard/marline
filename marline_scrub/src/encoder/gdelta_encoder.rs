@@ -7,23 +7,51 @@ use crate::{ChunkType, SBCHash, SBCKey, SBCMap};
 use chunkfs::Data;
 use chunkfs::Database;
 use marline_sketcher::speedsketch::{self, SpeedSketchConfig};
+use marline_sketcher::SpeedSketchHash;
 use std::cmp::min;
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex};
 use zstd::stream;
 
+/// Gdelta encoder that uses SpeedSketch to filter fingerprint table lookups.
+#[derive(Debug)]
 pub struct GdeltaEncoder {
     zstd_flag: bool,
     sketch_config: SpeedSketchConfig,
 }
 
-/// Everything a delta chunk is encoded against, built once per cluster: the bytes of the base
-/// chunk, the key it is stored under, its fingerprint table and its sketch.
-struct BaseChunk<'a, Hash: SBCHash> {
+/// The bytes, fingerprint table and sketch of a base chunk.
+struct BaseChunk<'a> {
     data: &'a [u8],
-    sbc_hash: Hash,
     word_hash_offsets: HashMap<u64, usize>,
     sketch: u64,
+}
+
+impl<'a> BaseChunk<'a> {
+    fn new(data: &'a [u8], sketch: Option<u64>, config: &SpeedSketchConfig) -> Self {
+        let word_size = speedsketch::WORD_SIZE;
+        let mask_bts = ((data.len() as f64).log2() as usize).max(1);
+        let mut word_hash_offsets = HashMap::new();
+        let mut base_sketch = sketch.unwrap_or(0);
+        let mut fp = 0;
+
+        if data.len() >= word_size {
+            for &byte in &data[..word_size - 1] {
+                fp = speedsketch::fp_step(fp, byte);
+            }
+
+            for (offset, &byte) in data[word_size - 1..].iter().enumerate() {
+                fp = speedsketch::fp_step(fp, byte);
+                word_hash_offsets.insert(fp >> (64 - mask_bts), offset);
+                if sketch.is_none() && speedsketch::is_proxy_with(fp, config.masks()) {
+                    base_sketch |= 1u64 << speedsketch::class_of(fp);
+                }
+            }
+        }
+
+        Self { data, word_hash_offsets, sketch: base_sketch }
+    }
 }
 
 impl Default for GdeltaEncoder {
@@ -47,13 +75,47 @@ impl GdeltaEncoder {
         &self.sketch_config
     }
 
+    /// Encodes a single chunk against an existing base using their precomputed SpeedSketch hashes.
+    /// The hashes must have been calculated from the supplied bytes with this encoder's masks.
+    /// The result uses the format expected by `GdeltaDecoder` with the same zstd setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a mismatched mask configuration, for input lengths that exceed the
+    /// delta format's length or offset limits, or when zstd compression fails.
+    pub fn encode_chunk_against(
+        &self,
+        chunk_data: &[u8],
+        chunk_hash: &SpeedSketchHash,
+        base_data: &[u8],
+        base_hash: &SpeedSketchHash,
+    ) -> io::Result<Vec<u8>> {
+        if chunk_data.len() >= 1 << 23 || base_data.len() > 1 << 24 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "chunk exceeds Gdelta limits"));
+        }
+
+        let config_id = Some(self.sketch_config.id());
+        if chunk_hash.sketch_config_id() != config_id || base_hash.sketch_config_id() != config_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hashes must use the Gdelta encoder's SpeedSketch configuration",
+            ));
+        }
+
+        let base = BaseChunk::new(base_data, base_hash.sketch(), &self.sketch_config);
+        let delta = Self::delta_code(chunk_data, &base, chunk_hash.sketch().unwrap_or_default());
+        if self.zstd_flag {
+            stream::encode_all(delta.as_slice(), 0)
+        } else {
+            Ok(delta)
+        }
+    }
+
     /// Encodes `chunk_data` against `base` as a list of INSERT and COPY instructions.
     ///
-    /// `sketch_input` is the sketch of the input chunk and `base.sketch` the sketch of the base
-    /// chunk. When the class bit of a word differs in the two sketches, that word has no
-    /// counterpart in the base chunk, so it is left to the enclosing insertion and the fingerprint
-    /// table is not probed at all.
-    fn delta_code(chunk_data: &[u8], base: &BaseChunk<impl SBCHash>, sketch_input: u64) -> Vec<u8> {
+    /// Uses `sketch_input` and `base.sketch` to filter fingerprint-table lookups. A differing
+    /// class bit skips the lookup for that word. Unmatched bytes are encoded as INSERTs.
+    fn delta_code(chunk_data: &[u8], base: &BaseChunk<'_>, sketch_input: u64) -> Vec<u8> {
         let parent_data = base.data;
         let word_size: usize = speedsketch::WORD_SIZE;
         let move_bts: usize = 64 / word_size;
@@ -77,8 +139,6 @@ impl GdeltaEncoder {
             fp = (fp << move_bts).wrapping_add(gear(chunk_data[j + word_size - 1]));
             let word_hash: u64 = fp >> (64 - mask_bts);
 
-            // Differing class bits prove the word is absent from the base chunk, so the
-            // lookup is skipped and the word becomes an insertion.
             if speedsketch::class_bit_matches(fp, sketch_input, base.sketch) {
                 if let Some(&offset) = base.word_hash_offsets.get(&word_hash) {
                     let mut equal_part_len: usize = 0;
@@ -136,7 +196,8 @@ impl GdeltaEncoder {
         target_map: Arc<Mutex<&mut SBCMap<D, Hash>>>,
         chunk_data: &[u8],
         hash: Hash,
-        base: &BaseChunk<Hash>,
+        base: &BaseChunk<'_>,
+        base_hash: &Hash,
     ) -> (usize, usize, SBCKey<Hash>) {
         if let Some(id) = hash.sketch_config_id() {
             assert_eq!(
@@ -145,7 +206,7 @@ impl GdeltaEncoder {
                 "chunk hash was produced with a different SpeedSketch configuration"
             );
         }
-        if let Some(id) = base.sbc_hash.sketch_config_id() {
+        if let Some(id) = base_hash.sketch_config_id() {
             assert_eq!(
                 id,
                 self.sketch_config.id(),
@@ -165,7 +226,7 @@ impl GdeltaEncoder {
         let sbc_hash = SBCKey {
             hash,
             chunk_type: ChunkType::Delta {
-                parent_hash: base.sbc_hash.clone(),
+                parent_hash: base_hash.clone(),
                 number: number_delta_chunk,
             },
         };
@@ -197,37 +258,8 @@ impl Encoder for GdeltaEncoder {
                 "parent chunk hash was produced with a different SpeedSketch configuration"
             );
         }
-        let word_size: usize = speedsketch::WORD_SIZE;
-        let move_bts: usize = 64 / word_size;
-        let mut word_hash_offsets: HashMap<u64, usize> = HashMap::new();
-        let mask_bts: usize = ((parent_data.len() as f64).log2() as usize).max(1);
-        let base_words: usize = parent_data.len().saturating_sub(word_size - 1);
-        let mut fp: u64 = 0;
-
-        // Sketch of the base chunk, built in the very same pass over the base chunk that
-        // fills the fingerprint table: every word that lands in the table must set its class bit,
-        // otherwise the exclusion could drop a word that is really there.
-        let mut base_sketch: u64 = 0;
-
-        for &byte in &parent_data[..base_words.min(word_size - 1)] {
-            fp = (fp << move_bts).wrapping_add(gear(byte));
-        }
-
-        for i in 0..base_words {
-            fp = (fp << move_bts).wrapping_add(gear(parent_data[i + word_size - 1]));
-            let word_hash: u64 = fp >> (64 - mask_bts);
-            word_hash_offsets.insert(word_hash, i);
-            if speedsketch::is_proxy_with(fp, self.sketch_config.masks()) {
-                base_sketch |= 1u64 << speedsketch::class_of(fp);
-            }
-        }
-
-        let base = BaseChunk {
-            data: parent_data.as_slice(),
-            sbc_hash: parent_sbc_hash,
-            word_hash_offsets,
-            sketch: base_sketch,
-        };
+        // Build the base sketch and fingerprint table in the same pass.
+        let base = BaseChunk::new(&parent_data, None, &self.sketch_config);
 
         for (chunk_id, (hash, data_container)) in cluster.iter_mut().enumerate() {
             if parent_chunk.index > -1 && chunk_id == parent_chunk.index as usize {
@@ -235,8 +267,13 @@ impl Encoder for GdeltaEncoder {
             }
             match data_container.extract() {
                 Data::Chunk(data) => {
-                    let (left, processed, sbc_hash) =
-                        self.encode_delta_chunk(target_map.clone(), data, hash.clone(), &base);
+                    let (left, processed, sbc_hash) = self.encode_delta_chunk(
+                        target_map.clone(),
+                        data,
+                        hash.clone(),
+                        &base,
+                        &parent_sbc_hash,
+                    );
                     data_left += left;
                     processed_data += processed;
                     data_container.make_target(vec![sbc_hash]);
@@ -423,42 +460,15 @@ mod tests {
     use super::*;
     use crate::decoder::GdeltaDecoder;
     use crate::encoder::encode_simple_chunk;
-    use marline_sketcher::SpeedSketchHash;
+    use marline_sketcher::{SBCHasher, SpeedSketchHasher};
 
     fn pattern(len: usize, seed: u8) -> Vec<u8> {
         (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
     }
 
-    /// Mirrors the base chunk state `encode_cluster` builds, so `delta_code` can be exercised
-    /// directly without a `DataContainer` cluster.
-    fn build_base<'a>(
-        data: &'a [u8],
-        sbc_hash: SpeedSketchHash,
-        config: &SpeedSketchConfig,
-    ) -> BaseChunk<'a, SpeedSketchHash> {
-        let word_size = speedsketch::WORD_SIZE;
-        let move_bts = 64 / word_size;
-        let mask_bts = ((data.len() as f64).log2() as usize).max(1);
-        let base_words = data.len().saturating_sub(word_size - 1);
-        let mut word_hash_offsets = HashMap::new();
-        let mut fp = 0u64;
-        for &byte in &data[..base_words.min(word_size - 1)] {
-            fp = (fp << move_bts).wrapping_add(gear(byte));
-        }
-        let mut sketch = 0u64;
-        for i in 0..base_words {
-            fp = (fp << move_bts).wrapping_add(gear(data[i + word_size - 1]));
-            word_hash_offsets.insert(fp >> (64 - mask_bts), i);
-            if speedsketch::is_proxy_with(fp, config.masks()) {
-                sketch |= 1u64 << speedsketch::class_of(fp);
-            }
-        }
-        BaseChunk { data, sbc_hash, word_hash_offsets, sketch }
-    }
-
     fn encode(base: &[u8], new: &[u8]) -> Vec<u8> {
         let config = SpeedSketchConfig::default();
-        let base_chunk = build_base(base, SpeedSketchHash::new_with_u32(0), &config);
+        let base_chunk = BaseChunk::new(base, None, &config);
         GdeltaEncoder::delta_code(new, &base_chunk, speedsketch::sketch_with(new, config.masks()))
     }
 
@@ -524,12 +534,7 @@ mod tests {
     #[test]
     fn delta_code_skips_lookup_when_class_bit_differs() {
         let new = pattern(64, 7);
-        let empty_base = BaseChunk {
-            data: &[],
-            sbc_hash: SpeedSketchHash::new_with_u32(0),
-            word_hash_offsets: HashMap::new(),
-            sketch: 0,
-        };
+        let empty_base = BaseChunk { data: &[], word_hash_offsets: HashMap::new(), sketch: 0 };
         let delta = GdeltaEncoder::delta_code(&new, &empty_base, u64::MAX);
 
         assert_eq!(count_copies(&delta), 0, "a cleared class bit must skip every lookup");
@@ -567,7 +572,7 @@ mod tests {
         assert_eq!(stored_key.hash, requested_parent_hash.next_hash());
 
         let config = SpeedSketchConfig::default();
-        let base = build_base(parent.as_slice(), stored_key.hash.clone(), &config);
+        let base = BaseChunk::new(&parent, None, &config);
         let delta = GdeltaEncoder::delta_code(
             child.as_slice(),
             &base,
@@ -580,5 +585,38 @@ mod tests {
         };
         map.insert(child_key.clone(), delta).unwrap();
         assert_eq!(map.get(&child_key).unwrap(), child);
+    }
+
+    #[test]
+    fn test_encode_chunk_against_rejects_mismatched_config() {
+        let base = pattern(128, 0);
+        let child = pattern(128, 1);
+        let encoder = GdeltaEncoder::default();
+        let base_hash =
+            SpeedSketchHasher::with_config(encoder.sketch_config().clone()).calculate_hash(&base);
+        let child_hash = SpeedSketchHasher::with_config(SpeedSketchConfig::uniform(8, 1).unwrap())
+            .calculate_hash(&child);
+
+        let result = encoder.encode_chunk_against(&child, &child_hash, &base, &base_hash);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_encode_chunk_against_with_zstd() {
+        let base = pattern(128, 0);
+        let mut child = base.clone();
+        child[40] ^= 1;
+        let encoder = GdeltaEncoder::new(true);
+        let hasher = SpeedSketchHasher::with_config(encoder.sketch_config().clone());
+        let delta = encoder
+            .encode_chunk_against(
+                &child,
+                &hasher.calculate_hash(&child),
+                &base,
+                &hasher.calculate_hash(&base),
+            )
+            .unwrap();
+
+        assert_eq!(GdeltaDecoder::new(true).decode_chunk(base, &delta), child);
     }
 }

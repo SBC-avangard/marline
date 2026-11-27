@@ -105,6 +105,11 @@ Similarity detection and hashing:
 - **ODESS Hasher**: Advanced sketching algorithm
 - **Broder's Method**: MinHash-based similarity estimation
 
+### [`marline_online`](marline_online/)
+In-memory online deduplication with SpeedSketch. `SpeedSketchOnline` implements `OnlineSBC` using
+FastCDC (4/8/64 KiB), BLAKE3 fingerprints, and Gdelta. Each `write` deduplicates chunks against
+those already stored.
+
 ### [`marline_delta`](marline_delta/)
 Delta encoding utilities and shared components.
 
