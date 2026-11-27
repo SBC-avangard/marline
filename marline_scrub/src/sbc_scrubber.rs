@@ -349,12 +349,17 @@ where
         #[cfg(feature = "runtime-metrics")]
         let mut metrics_batch = self.metrics.as_ref().map(MetricsRecorder::batch);
 
+        #[cfg(feature = "runtime-metrics")]
+        let start_stage = |stage| {
+            self.metrics
+                .as_ref()
+                .is_some_and(|recorder| recorder.is_enabled(stage))
+                .then(Instant::now)
+        };
+
         // 1. Hashing: compute similarity hashes in parallel
         #[cfg(feature = "runtime-metrics")]
-        let hashing_enabled =
-            self.metrics.as_ref().is_some_and(|recorder| recorder.is_enabled(Stage::SbcHashing));
-        #[cfg(feature = "runtime-metrics")]
-        let hashing_start = hashing_enabled.then(Instant::now);
+        let hashing_start = start_stage(Stage::SbcHashing);
         pool.install(|| {
             mut_refs_database.par_iter_mut().for_each(|data_container| {
                 match data_container.extract() {
@@ -371,40 +376,27 @@ where
             });
         });
         #[cfg(feature = "runtime-metrics")]
-        if hashing_enabled {
-            if let Some(batch) = metrics_batch.as_mut() {
-                batch.record_unconditionally(Stage::SbcHashing, hashing_start.unwrap().elapsed());
-            }
+        if let (Some(batch), Some(start)) = (metrics_batch.as_mut(), hashing_start) {
+            batch.record_unconditionally(Stage::SbcHashing, start.elapsed());
         }
 
         // 2. Clustering: group chunks by similarity
         #[cfg(feature = "runtime-metrics")]
-        let cluster_enabled =
-            self.metrics.as_ref().is_some_and(|recorder| recorder.is_enabled(Stage::SbcClustering));
-        #[cfg(feature = "runtime-metrics")]
-        let cluster_start = cluster_enabled.then(Instant::now);
+        let cluster_start = start_stage(Stage::SbcClustering);
         let (mut clusters, clusterization_report) =
             self.clusterer.clusterize(sbc_hash_chunk.into_inner().unwrap());
         #[cfg(feature = "runtime-metrics")]
-        if cluster_enabled {
-            if let Some(batch) = metrics_batch.as_mut() {
-                batch
-                    .record_unconditionally(Stage::SbcClustering, cluster_start.unwrap().elapsed());
-            }
+        if let (Some(batch), Some(start)) = (metrics_batch.as_mut(), cluster_start) {
+            batch.record_unconditionally(Stage::SbcClustering, start.elapsed());
         }
 
         // 3. Encoding: encode clusters and store in target map
         #[cfg(feature = "runtime-metrics")]
-        let encode_enabled =
-            self.metrics.as_ref().is_some_and(|recorder| recorder.is_enabled(Stage::SbcEncoding));
-        #[cfg(feature = "runtime-metrics")]
-        let encode_start = encode_enabled.then(Instant::now);
+        let encode_start = start_stage(Stage::SbcEncoding);
         let (data_left, processed_data) = self.encoder.encode_clusters(&mut clusters, target_map);
         #[cfg(feature = "runtime-metrics")]
-        if encode_enabled {
-            if let Some(batch) = metrics_batch.as_mut() {
-                batch.record_unconditionally(Stage::SbcEncoding, encode_start.unwrap().elapsed());
-            }
+        if let (Some(batch), Some(start)) = (metrics_batch.as_mut(), encode_start) {
+            batch.record_unconditionally(Stage::SbcEncoding, start.elapsed());
         }
 
         let running_time = total_start.elapsed();

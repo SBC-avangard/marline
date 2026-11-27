@@ -131,15 +131,15 @@ let scrubber = SBCScrubber::new(hasher, clusterer, encoder)
 
 // Запустить pipeline с scrubber, затем получить агрегаты.
 let snapshot = recorder.snapshot();
-for metric in snapshot.stages {
+for metric in snapshot.stages() {
     println!(
         "{}: count={}, total={:?}, average={:?}, min={:?}, max={:?}, p99={:?}",
-        metric.stage.as_str(),
-        metric.count,
-        metric.total,
-        metric.average,
-        metric.min,
-        metric.max,
+        metric.stage().as_str(),
+        metric.count(),
+        metric.total(),
+        metric.average(),
+        metric.min(),
+        metric.max(),
         metric.p99(),
     );
 }
@@ -160,7 +160,9 @@ for metric in snapshot.stages {
 | `snapshot()` | Получить согласованный снимок накопленных агрегатов. |
 | `clear()` | Очистить агрегаты, не меняя включённые стадии. Batch, созданные до очистки, будут отброшены при последующем `Drop`. |
 
-`StageMetrics` содержит `count`, `total`, `average`, `min`, `max` и приближённые `p50()`, `p90()`, `p99()`. Перцентили — верхние границы bucket-ов гистограммы с фиксированной памятью.
+`StageMetrics` предоставляет методы `count()`, `total()`, `average()`, `min()`, `max()` и приближённые `p50()`, `p90()`, `p99()`. Перцентили — верхние границы bucket-ов гистограммы с фиксированной памятью.
+
+При одном измерении приложение `marline` выводит его длительность в консоли, оставляет поля перцентилей пустыми в `stage_metrics.csv` и записывает в них `null` в `stage_metrics.json`.
 
 Batch сливает локальные агрегаты в recorder в `Drop`. Если snapshot нужен сразу после вызова, уничтожьте batch явно через `drop(batch)` до `snapshot()`. Snapshot содержит только стадии, для которых записано хотя бы одно измерение.
 

@@ -91,8 +91,8 @@ mod test {
         for expected in
             [Stage::SbcHashing, Stage::SbcClustering, Stage::SbcEncoding, Stage::SbcScrubTotal]
         {
-            let stage = snapshot.stages.iter().find(|metric| metric.stage == expected).unwrap();
-            assert_eq!(stage.count, 1, "unexpected count for {}", expected.as_str());
+            let stage = snapshot.stages().iter().find(|metric| metric.stage() == expected).unwrap();
+            assert_eq!(stage.count(), 1, "unexpected count for {}", expected.as_str());
         }
     }
 

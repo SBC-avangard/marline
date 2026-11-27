@@ -1,4 +1,4 @@
-//! Lightweight, opt-in latency metrics shared by Marlin pipeline implementations.
+//! Lightweight, opt-in latency metrics shared by Marline pipeline implementations.
 //!
 //! A recorder is disabled by default. Enable all stages or selected stages before or
 //! during a run. A measurement is included if its stage is enabled when the measured
@@ -9,37 +9,65 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Stable names for latency measurements emitted by Marlin pipelines.
+/// Stable names for latency measurements emitted by Marline pipelines.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum Stage {
+    /// Create, write and close the input file during the CDC phase.
     Cdc = 0,
+    /// Compute similarity hashes for source chunks.
     SbcHashing,
+    /// Group chunks by similarity.
     SbcClustering,
+    /// Encode clusters into base and delta chunks.
     SbcEncoding,
+    /// Hash, cluster and encode after preparing the thread pool and chunk references.
     SbcScrubTotal,
+    /// Generate features used to find similar chunks in the Palantir scrubber.
     PalantirFeatureGeneration,
+    /// Look up a chunk fingerprint for an exact match.
     PalantirFingerprintLookup,
+    /// Look up super-features to find similar chunks.
     PalantirSuperFeatureLookup,
+    /// Retrieve a candidate base chunk for delta encoding.
     PalantirBaseLookup,
+    /// Encode a chunk relative to its base.
     PalantirEncoding,
+    /// Compress chunk data during scrubbing.
     PalantirCompression,
+    /// Write processed chunk data to storage.
     PalantirStorageWrite,
+    /// Update metadata for the processed chunk.
     PalantirMetadataUpdate,
+    /// Process a complete Palantir scrub operation.
     PalantirScrubTotal,
+    /// Run the filesystem scrub call, including scrubber setup.
     PipelineScrub,
+    /// Run a complete benchmark iteration through the final deduplication ratio calculation.
     PipelineTotal,
+    /// Split the incoming stream with FastCDC and collect raw features.
     OnlineChunkingAndFeatureCollection,
+    /// Generate searchable features from collected raw features.
     OnlineFeatureGeneration,
+    /// Look up exact chunk fingerprints during an online write.
     OnlineFingerprintLookup,
+    /// Search the online index for matching super-features.
     OnlineSuperFeatureLookup,
+    /// Retrieve base data for an online delta.
     OnlineBaseLookup,
+    /// Delta-encode chunk data during an online write.
     OnlineEncoding,
+    /// Compress data during an online write.
     OnlineCompression,
+    /// Write chunk data to the online store.
     OnlineStorageWrite,
+    /// Update metadata during an online write.
     OnlineMetadataUpdate,
+    /// Process a complete online write operation.
     OnlineWriteTotal,
+    /// Compute the fingerprint used for exact chunk matching.
     OnlineFingerprintHash,
+    /// Process a complete dataset through the online pipeline.
     OnlineDatasetTotal,
 }
 
@@ -122,7 +150,8 @@ impl Stage {
 }
 
 const STAGE_COUNT: usize = Stage::ALL.len();
-const HISTOGRAM_BUCKETS: usize = 64;
+const _: () = assert!(STAGE_COUNT <= u64::BITS as usize);
+const HISTOGRAM_BUCKETS: usize = u64::BITS as usize;
 
 struct StageAggregate {
     count: u64,
@@ -237,7 +266,7 @@ impl MetricsRecorder {
     /// Enable or disable all stages.
     pub fn set_all_enabled(&self, enabled: bool) {
         use std::sync::atomic::Ordering;
-        let mask = if enabled { (1u64 << STAGE_COUNT) - 1 } else { 0 };
+        let mask = if enabled { u64::MAX } else { 0 };
         self.0.enabled.store(mask, Ordering::Relaxed);
     }
 
@@ -344,22 +373,59 @@ impl Drop for MetricsBatch {
 /// Immutable metrics snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct MetricsSnapshot {
-    pub stages: Vec<StageMetrics>,
+    stages: Vec<StageMetrics>,
+}
+
+impl MetricsSnapshot {
+    /// Aggregates for stages with at least one recorded sample.
+    pub fn stages(&self) -> &[StageMetrics] {
+        &self.stages
+    }
 }
 
 /// Aggregate latency data for one stage.
 #[derive(Clone, Debug)]
 pub struct StageMetrics {
-    pub stage: Stage,
-    pub count: u64,
-    pub total: Duration,
-    pub average: Duration,
-    pub min: Duration,
-    pub max: Duration,
+    stage: Stage,
+    count: u64,
+    total: Duration,
+    average: Duration,
+    min: Duration,
+    max: Duration,
     histogram: [u64; HISTOGRAM_BUCKETS],
 }
 
 impl StageMetrics {
+    /// The pipeline stage that produced these samples.
+    pub fn stage(&self) -> Stage {
+        self.stage
+    }
+
+    /// The number of samples collected for the stage.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// The sum of all recorded sample durations.
+    pub fn total(&self) -> Duration {
+        self.total
+    }
+
+    /// The arithmetic mean of the sample durations, rounded down to nanoseconds.
+    pub fn average(&self) -> Duration {
+        self.average
+    }
+
+    /// The shortest recorded sample duration.
+    pub fn min(&self) -> Duration {
+        self.min
+    }
+
+    /// The longest recorded sample duration.
+    pub fn max(&self) -> Duration {
+        self.max
+    }
+
     /// Approximate percentile from a fixed-memory, base-2 latency histogram.
     /// The result is an upper bound for the selected histogram bucket.
     pub fn percentile(&self, percentile: f64) -> Option<Duration> {
@@ -371,7 +437,11 @@ impl StageMetrics {
         for (index, count) in self.histogram.iter().enumerate() {
             cumulative = cumulative.saturating_add(*count);
             if cumulative >= rank {
-                let upper_bound = if index == 63 { u64::MAX } else { (1u64 << (index + 1)) - 1 };
+                let upper_bound = if index == HISTOGRAM_BUCKETS - 1 {
+                    u64::MAX
+                } else {
+                    (1u64 << (index + 1)) - 1
+                };
                 return Some(duration_from_nanos(upper_bound as u128));
             }
         }
@@ -409,23 +479,31 @@ mod tests {
             let mut batch = recorder.batch();
             batch.measure(Stage::SbcHashing, || ());
         }
-        assert!(recorder.snapshot().stages.is_empty());
+        assert!(recorder.snapshot().stages().is_empty());
     }
 
     #[test]
     fn batches_merge_samples_and_expose_percentiles() {
         let recorder = MetricsRecorder::enabled_all();
-        {
-            let mut batch = recorder.batch();
-            batch.record(Stage::Cdc, Duration::from_nanos(10));
-            batch.record(Stage::Cdc, Duration::from_nanos(20));
-        }
+        let mut first = recorder.batch();
+        let mut second = recorder.batch();
+        first.record(Stage::Cdc, Duration::from_nanos(10));
+        second.record(Stage::Cdc, Duration::from_nanos(40));
+        drop(first);
+        drop(second);
+
         let snapshot = recorder.snapshot();
-        let cdc = &snapshot.stages[0];
-        assert_eq!(cdc.count, 2);
-        assert_eq!(cdc.min, Duration::from_nanos(10));
-        assert_eq!(cdc.max, Duration::from_nanos(20));
+        assert_eq!(snapshot.stages().len(), 1);
+        let cdc = &snapshot.stages()[0];
+        assert_eq!(cdc.stage(), Stage::Cdc);
+        assert_eq!(cdc.count(), 2);
+        assert_eq!(cdc.total(), Duration::from_nanos(50));
+        assert_eq!(cdc.average(), Duration::from_nanos(25));
+        assert_eq!(cdc.min(), Duration::from_nanos(10));
+        assert_eq!(cdc.max(), Duration::from_nanos(40));
         assert_eq!(cdc.p50(), Some(Duration::from_nanos(15)));
+        assert_eq!(cdc.p90(), Some(Duration::from_nanos(63)));
+        assert_eq!(cdc.p99(), Some(Duration::from_nanos(63)));
     }
 
     #[test]
@@ -447,8 +525,8 @@ mod tests {
             });
         }
         let snapshot = recorder.snapshot();
-        assert_eq!(snapshot.stages[0].stage, Stage::Cdc);
-        assert_eq!(snapshot.stages[0].count, 1);
+        assert_eq!(snapshot.stages()[0].stage(), Stage::Cdc);
+        assert_eq!(snapshot.stages()[0].count(), 1);
     }
 
     #[test]
@@ -460,6 +538,6 @@ mod tests {
         recorder.clear();
         drop(batch);
 
-        assert!(recorder.snapshot().stages.is_empty());
+        assert!(recorder.snapshot().stages().is_empty());
     }
 }
