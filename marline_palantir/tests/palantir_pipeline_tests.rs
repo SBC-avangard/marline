@@ -161,34 +161,25 @@ impl SuperFeatureGenerator for FixedFeatures {
     }
 }
 
-struct FixedDeltaEncoder(usize);
+struct FixedDeltaEncoder {
+    delta_len: usize,
+    early_alpha: bool,
+}
 
 impl PalantirEncoder for FixedDeltaEncoder {
     fn encode(&self, _: &[u8], _: &[u8]) -> Vec<u8> {
-        vec![0; self.0]
+        assert!(!self.early_alpha, "expected bounded encoding");
+        vec![0; self.delta_len]
     }
 
     fn encode_below_limit(&self, _: &[u8], _: &[u8], limit: usize) -> Option<Vec<u8>> {
-        (self.0 < limit).then(|| vec![0; self.0])
+        assert!(self.early_alpha, "expected full encoding");
+        assert_eq!(limit, 10);
+        (self.delta_len < limit).then(|| vec![0; self.delta_len])
     }
 
-    fn encode_with_manifest(
-        &self,
-        new_chunk: &[u8],
-        base_chunk: &[u8],
-        _: &HashMap<u64, u32>,
-    ) -> Vec<u8> {
-        self.encode(new_chunk, base_chunk)
-    }
-
-    fn encode_with_manifest_below_limit(
-        &self,
-        new_chunk: &[u8],
-        base_chunk: &[u8],
-        _: &HashMap<u64, u32>,
-        limit: usize,
-    ) -> Option<Vec<u8>> {
-        self.encode_below_limit(new_chunk, base_chunk, limit)
+    fn encode_with_manifest(&self, _: &[u8], _: &[u8], _: &HashMap<u64, u32>) -> Vec<u8> {
+        panic!("scrubber bases have no manifest")
     }
 
     fn generate_fp_table(_: &[u8]) -> Option<HashMap<u64, u32>> {
@@ -204,7 +195,7 @@ fn alpha_case(delta_len: usize, early_alpha: bool) -> (u64, HashMap<[u8; 32], Ve
     let target_hash = [2; 32];
     let mut scrubber = PalantirScrubber::new(
         FixedFeatures(features),
-        FixedDeltaEncoder(delta_len),
+        FixedDeltaEncoder { delta_len, early_alpha },
         TierConfig::new([1]),
         LifecycleManager::<1>::default_configs(),
         SearchConfig::default(),
@@ -228,7 +219,7 @@ fn alpha_boundary_is_deterministic_and_independent_of_early_encoding() {
     let delta_full = alpha_case(9, false);
     assert_eq!(delta_early, delta_full);
     assert_eq!(delta_early.0, 1);
-    assert_ne!(delta_early.1.get(&[2; 32]), Some(&delta_early.2));
+    assert_eq!(delta_early.1.get(&[2; 32]).unwrap(), &[0; 9]);
 
     let base_early = alpha_case(10, true);
     let base_full = alpha_case(10, false);
