@@ -40,6 +40,10 @@ pub struct PalantirScrubber<
     encoder: E,
     /// False-positive threshold for delta encoding ratio.
     fp_threshold: f64,
+    /// Promote a chunk when its uncompressed Gdelta reaches this fraction of the base size.
+    delta_promote_threshold: Option<f64>,
+    /// Stop Gdelta as soon as the promotion threshold is reached.
+    early_alpha: bool,
     /// Total chunks processed.
     chunks_processed: u64,
     /// Count of chunks stored as deltas.
@@ -80,6 +84,8 @@ impl<S, H: ChunkHash + Clone + Eq + Hash + Send + Sync + 'static, E, const N: us
             metadata_manager: MetadataManager::new(tier_config, lifecycle_configs, &search_config),
             encoder,
             fp_threshold: 0.9,
+            delta_promote_threshold: None,
+            early_alpha: true,
             chunks_processed: 0,
             delta_stored: 0,
             delta_bases: HashMap::new(),
@@ -89,6 +95,20 @@ impl<S, H: ChunkHash + Clone + Eq + Hash + Send + Sync + 'static, E, const N: us
 
     pub fn delta_stored(&self) -> u64 {
         self.delta_stored
+    }
+
+    /// Sets the ratio of raw Gdelta bytes to base bytes at which a chunk becomes a base.
+    ///
+    /// This applies to the scrubber path that stores the delta as-is. A manifest-backed
+    /// delta still uses the existing Zstd size comparison. Nonpositive and nonfinite
+    /// thresholds disable alpha, as does `None`.
+    pub fn set_delta_promote_threshold(&mut self, threshold: Option<f64>) {
+        self.delta_promote_threshold = threshold;
+    }
+
+    /// Toggles early termination for raw Gdelta. Both modes apply the same byte limit.
+    pub fn set_early_alpha(&mut self, enabled: bool) {
+        self.early_alpha = enabled;
     }
 
     pub fn fp_table_size(&self) -> usize {
@@ -137,45 +157,51 @@ where
                         None => {
                             match self.metadata_manager.lookup_super_features(&super_features) {
                                 Some((base_hash, _)) => {
-                                    match get_manifest(
+                                    let (base_chunk, manifest) = get_manifest(
                                         &self.manifest_base,
                                         &self.delta_bases,
                                         &base_hash.hash,
-                                    ) {
-                                        (base_chunk, None) => {
-                                            let delta = self.encoder.encode(chunk_data, base_chunk);
-                                            let delta_compressed = delta.clone();
-                                            let simple_compressed = delta.clone();
-                                            let _ratio = delta_compressed.len() as f64
-                                                / simple_compressed.len() as f64;
-
-                                            let _ = &mut target_map.insert(*hash, delta_compressed);
-                                            self.delta_bases.insert(*hash, base_hash.hash);
-                                            self.delta_stored += 1;
-                                        }
-                                        (base_chunk, Some(manifest)) => {
-                                            let delta = self.encoder.encode_with_manifest(
-                                                chunk_data, base_chunk, manifest,
-                                            );
-                                            let delta_compressed =
-                                                zstd::encode_all(delta.as_slice(), 0)?;
-                                            let simple_compressed =
-                                                zstd::encode_all(chunk_data.as_slice(), 0)?;
-                                            let ratio = delta_compressed.len() as f64
-                                                / simple_compressed.len() as f64;
-                                            if ratio < self.fp_threshold {
-                                                let _ =
-                                                    &mut target_map.insert(*hash, delta_compressed);
-                                                self.delta_bases.insert(*hash, base_hash.hash);
-                                                self.delta_stored += 1;
-                                            } else {
-                                                target_map.insert(*hash, chunk_data.clone());
-                                                let _ = &mut self.manifest_base.insert(
-                                                    *hash,
-                                                    Entry::from(chunk_data.clone()),
-                                                )?;
+                                    );
+                                    let stored_delta = if let Some(manifest) = manifest {
+                                        let delta = self
+                                            .encoder
+                                            .encode_with_manifest(chunk_data, base_chunk, manifest);
+                                        let delta_compressed =
+                                            zstd::encode_all(delta.as_slice(), 0)?;
+                                        let simple_compressed =
+                                            zstd::encode_all(chunk_data.as_slice(), 0)?;
+                                        let ratio = delta_compressed.len() as f64
+                                            / simple_compressed.len() as f64;
+                                        (ratio < self.fp_threshold).then_some(delta_compressed)
+                                    } else {
+                                        let limit = self
+                                            .delta_promote_threshold
+                                            .filter(|alpha| alpha.is_finite() && *alpha > 0.0)
+                                            .map(|alpha| {
+                                                (alpha * base_chunk.len() as f64).ceil() as usize
+                                            });
+                                        match (limit, self.early_alpha) {
+                                            (Some(limit), true) => self
+                                                .encoder
+                                                .encode_below_limit(chunk_data, base_chunk, limit),
+                                            _ => {
+                                                let delta =
+                                                    self.encoder.encode(chunk_data, base_chunk);
+                                                limit
+                                                    .is_none_or(|limit| delta.len() < limit)
+                                                    .then_some(delta)
                                             }
                                         }
+                                    };
+
+                                    if let Some(delta) = stored_delta {
+                                        target_map.insert(*hash, delta);
+                                        self.delta_bases.insert(*hash, base_hash.hash);
+                                        self.delta_stored += 1;
+                                    } else {
+                                        target_map.insert(*hash, chunk_data.clone());
+                                        self.manifest_base
+                                            .insert(*hash, Entry::from(chunk_data.clone()))?;
                                     }
                                     processed_data += chunk_data.len();
                                 }
