@@ -6,10 +6,9 @@ use chunkfs::hashers::Sha256Hasher;
 use chunkfs::FileSystem;
 #[cfg(feature = "runtime-metrics")]
 use marline_metrics::{MetricsRecorder, Stage};
-use marline_scrub::encoder::GdeltaEncoder;
 use marline_scrub::{clusterer, decoder};
 use marline_scrub::{SBCMap, SBCScrubber};
-use marline_sketcher::SpeedSketchHasher;
+use marline_sketcher::SpeedSketchConfig;
 use std::collections::HashMap;
 use std::io;
 use std::time::Instant;
@@ -44,13 +43,12 @@ fn main() -> io::Result<()> {
         let total_metrics_enabled = metrics.is_enabled(Stage::PipelineTotal);
         let total_start = Instant::now();
 
-        // According to Odess sizes
-        let chunk_size = SizeParams::new(16 * 1024, 32 * 1024, 64 * 1024);
+        let chunk_size = SizeParams::new(4 * 1024, 8 * 1024, 64 * 1024);
 
-        let scrubber = SBCScrubber::new(
-            SpeedSketchHasher::new(),
+        let scrubber = SBCScrubber::new_speedsketch(
+            SpeedSketchConfig::default(),
             clusterer::EqClusterer::new(0),
-            GdeltaEncoder::new(false),
+            false,
         );
         #[cfg(feature = "runtime-metrics")]
         let scrubber = scrubber.with_metrics(metrics.clone());
