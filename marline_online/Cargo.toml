@@ -1,0 +1,11 @@
+[package]
+name = "marline_online"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+blake3.workspace = true
+chunkfs = { workspace = true, features = ["chunkers"] }
+marline_palantir = { path = "../marline_palantir" }
+marline_scrub = { path = "../marline_scrub" }
+marline_sketcher = { path = "../marline_sketcher" }

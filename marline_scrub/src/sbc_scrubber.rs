@@ -1,8 +1,8 @@
 use crate::clusterer::Clusterer;
 use crate::decoder::Decoder;
-use crate::encoder::Encoder;
+use crate::encoder::{Encoder, GdeltaEncoder};
 use crate::{ChunkType, SBCHash, SBCKey, SBCMap};
-use marline_sketcher::SBCHasher;
+use marline_sketcher::{SBCHasher, SpeedSketchConfig, SpeedSketchHash, SpeedSketchHasher};
 
 use chunkfs::{
     ChunkHash, Data, DataContainer, Database, IterableDatabase, Scrub, ScrubMeasurements,
@@ -298,6 +298,23 @@ where
     pub fn with_metrics(mut self, recorder: MetricsRecorder) -> Self {
         self.metrics = Some(recorder);
         self
+    }
+}
+
+impl<C> SBCScrubber<SpeedSketchHash, SpeedSketchHasher, C, GdeltaEncoder>
+where
+    C: Clusterer<SpeedSketchHash>,
+{
+    /// Creates a SpeedSketch scrubber from one mask configuration.
+    ///
+    /// The configuration generates its masks once and is shared by the hasher and the delta
+    /// encoder, so both sides use the same masks and configuration identifier.
+    pub fn new_speedsketch(config: SpeedSketchConfig, clusterer: C, zstd_flag: bool) -> Self {
+        SBCScrubber::new(
+            SpeedSketchHasher::with_config(config.clone()),
+            clusterer,
+            GdeltaEncoder::with_sketch_config(zstd_flag, config),
+        )
     }
 }
 
